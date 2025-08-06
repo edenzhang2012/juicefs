@@ -315,10 +315,10 @@ type Entry struct {
 // Slice is a slice of a chunk.
 // Multiple slices could be combined together as a chunk.
 type Slice struct {
-	Id   uint64
-	Size uint32
-	Off  uint32
-	Len  uint32
+	Id   uint64 //Slice 的 ID，全局唯一
+	Size uint32 //Slice 的总大小
+	Off  uint32 //有效数据在此 Slice 中的偏移位置
+	Len  uint32 //有效数据在此 Slice 中的大小
 }
 
 // Summary represents the total number of files/directories and

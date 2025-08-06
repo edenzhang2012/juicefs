@@ -54,7 +54,7 @@ type pendingItem struct {
 // slice for read and remove
 type rSlice struct {
 	id     uint64
-	length int
+	length int //slice中已经有的数据长度
 	store  *cachedStore
 }
 
@@ -93,6 +93,7 @@ func (s *rSlice) keys() []string {
 	return keys
 }
 
+// 若配置了缓存，从缓存中读取，否则就直接从后端存储读取
 func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err error) {
 	p := page.Data
 	if len(p) == 0 {
@@ -105,6 +106,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	indx := s.index(off)
 	boff := off % s.store.conf.BlockSize
 	blockSize := s.blockSize(indx)
+	//拆分为block进行读取
 	if boff+len(p) > blockSize {
 		// read beyond current page
 		var got int
@@ -269,12 +271,12 @@ func freePage(p *Page) {
 // slice for write only
 type wSlice struct {
 	rSlice
-	pages       [][]*Page
-	uploaded    int
+	pages       [][]*Page //内存中的缓存数据。二维数组，每一行代表一个block内；每一列代表小于等于一个block的写入量。每行最少有一个以上的元素
+	uploaded    int       //Slice中已经下刷到后端存储的数据长度
 	errors      chan error
 	uploadError error
 	pendings    int
-	writeback   bool
+	writeback   bool //配置了磁盘缓存并且开启了writeback
 }
 
 func sliceForWrite(id uint64, store *cachedStore) *wSlice {
@@ -294,6 +296,8 @@ func (s *wSlice) SetWriteback(enabled bool) {
 	s.writeback = enabled
 }
 
+// off：数据在Slice中的偏移量
+// 将数据从用户buff中拷贝到wslice的pages中
 func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 	if int(off)+len(p) > chunkSize {
 		return 0, fmt.Errorf("write out of chunk boudary: %d > %d", int(off)+len(p), chunkSize)
@@ -383,6 +387,7 @@ func (store *cachedStore) delete(key string) error {
 	return err
 }
 
+// 将数据上传到后端对象存储。若s!=nil && 符合条件，则先将数据缓存起来
 func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	sync := s != nil
 	blen := len(block.Data)
@@ -427,6 +432,7 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 	return err
 }
 
+// 异步上传，根据配置选择上传到缓存盘还是后端对象存储
 func (s *wSlice) upload(indx int) {
 	blen := s.blockSize(indx)
 	key := s.key(indx)
@@ -450,12 +456,14 @@ func (s *wSlice) upload(indx int) {
 		if off != blen {
 			panic(fmt.Sprintf("block length does not match: %v != %v", off, blen))
 		}
+		//writeback 数据先写到disk cache中，然后直接返回
 		if s.writeback {
 			stagingPath := "unknown"
 			stageFailed := false
 			block.Acquire()
 			err := utils.WithTimeout(func() (err error) { // In case it hangs for more than 5 minutes(see fileWriter.flush), fallback to uploading directly to avoid `EIO`
 				defer block.Release()
+				//直接将数据写入到disk cache中
 				stagingPath, err = s.store.bcache.stage(key, block.Data, s.store.shouldCache(blen))
 				if err == nil && stageFailed { // upload thread already marked me as failed because of timeout
 					_ = s.store.bcache.removeStage(key)
@@ -470,16 +478,18 @@ func (s *wSlice) upload(indx int) {
 				}
 			} else {
 				s.errors <- nil
+				//若设置了立即上传 && 在上传时间段内，则直接上传。上传完成后返回
 				if s.store.conf.UploadDelay == 0 && s.store.canUpload() {
 					select {
+					//检查是否可以上传
 					case s.store.currentUpload <- true:
 						defer func() { <-s.store.currentUpload }()
-						if err = s.store.upload(key, block, nil); err == nil {
-							s.store.bcache.uploaded(key, blen)
-							if err := s.store.bcache.removeStage(key); err != nil {
+						if err = s.store.upload(key, block, nil); err == nil { //这里数据直接上传到后端存储
+							s.store.bcache.uploaded(key, blen)                      //更新cache.used
+							if err := s.store.bcache.removeStage(key); err != nil { //删除磁盘缓存
 								logger.Warnf("failed to remove stage %s in upload", stagingPath)
 							}
-						} else { // add to delay list and wait for later scanning
+						} else { // add to delay list and wait for later scanning 上传失败，等会儿再试
 							s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
 						}
 						return
@@ -487,12 +497,14 @@ func (s *wSlice) upload(indx int) {
 					}
 				}
 				block.Release()
+				//添加到定时任务，延时上传
 				s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
 				return
 			}
 		}
 		s.store.currentUpload <- true
 		defer func() { <-s.store.currentUpload }()
+		//write through。先将数据写入到缓存（可能是mem cache也可能是disk cache）中，然后还要上传到后端存储
 		s.errors <- s.store.upload(key, block, s)
 	}()
 }
@@ -505,6 +517,8 @@ func (s *wSlice) Len() int {
 	return s.length
 }
 
+// ana: offset: 已写入数据的尾坐标
+// 将数据按照block下刷
 func (s *wSlice) FlushTo(offset int) error {
 	if offset < s.uploaded {
 		panic(fmt.Sprintf("Invalid offset: %d < %d", offset, s.uploaded))
@@ -555,35 +569,35 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir          string
-	CacheMode         os.FileMode
-	CacheSize         uint64
-	CacheItems        int64
-	CacheChecksum     string
-	CacheEviction     string
-	CacheScanInterval time.Duration
-	CacheExpire       time.Duration
-	OSCache           bool
-	FreeSpace         float32
-	AutoCreate        bool
-	Compress          string
-	MaxUpload         int
-	MaxStageWrite     int
-	MaxRetries        int
-	UploadLimit       int64 // bytes per second
-	DownloadLimit     int64 // bytes per second
-	Writeback         bool
-	UploadDelay       time.Duration
-	UploadHours       string
-	HashPrefix        bool
-	BlockSize         int
-	GetTimeout        time.Duration
-	PutTimeout        time.Duration
-	CacheFullBlock    bool
-	CacheLargeWrite   bool
-	BufferSize        uint64
-	Readahead         int
-	Prefetch          int
+	CacheDir          string        //directory paths of local cache, use colon to separate multiple paths，默认为"/var/jfsCache"
+	CacheMode         os.FileMode   //file permissions for cached blocks，默认0600，only owner can read/write cache
+	CacheSize         uint64        //size of cached object for read in MiB，默认100G
+	CacheItems        int64         //max number of cached items (0 for unlimited),默认0
+	CacheChecksum     string        //checksum level (none, full, shrink, extend),默认extend
+	CacheEviction     string        //cache eviction policy (none or 2-random)缓存淘汰策略,默认2-random
+	CacheScanInterval time.Duration //interval to scan cache-dir to rebuild in-memory index，默认1h
+	CacheExpire       time.Duration //cached blocks not accessed for longer than this option will be automatically evicted (0 means never),默认0
+	OSCache           bool          //是否使用操作系统的cache，通过环境变量"JFS_DROP_OSCACHE"设置。若为false在特定情况下会释放系统的OScache来释放内存空间
+	FreeSpace         float32       //min free space (ratio)，默认0.1
+	AutoCreate        bool          //是否自动创建disk cache目录，默认为true
+	Compress          string        //压缩算法，默认为”“
+	MaxUpload         int           //number of connections to upload.并发上传连接数，默认20
+	MaxStageWrite     int           //number of threads allowed to write staged files, other requests will be uploaded directly (this option is only effective when 'writeback' mode is enabled)。默认1000
+	MaxRetries        int           //number of retries after network failure，默认10
+	UploadLimit       int64         // bytes per second
+	DownloadLimit     int64         // bytes per second
+	Writeback         bool          //upload blocks in background，客户端写缓存，数据先落到本地磁盘，默认为false
+	UploadDelay       time.Duration //delayed duration for uploading blocks，延迟上传时间，默认为0
+	UploadHours       string        //(start-end) hour of a day between which the delayed blocks can be uploaded.默认不设置
+	HashPrefix        bool          //从format带过来的参数，读缓存key的组成格式略有不同
+	BlockSize         int           //block大小，默认4M
+	GetTimeout        time.Duration //从对象存储拉取数据的超时时间
+	PutTimeout        time.Duration //往对象存储写入数据的超时时间
+	CacheFullBlock    bool          //只缓存完整的block
+	CacheLargeWrite   bool          //cache full blocks after uploading
+	BufferSize        uint64        //total read/write buffering in MiB,默认300M
+	Readahead         int           //max buffering for read ahead in MiB per read session，若未设置，默认为8个block = 32M
+	Prefetch          int           //并行预取n个block，默认1
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -675,16 +689,17 @@ type cachedStore struct {
 	fetcher       *prefetcher
 	conf          Config
 	group         *Controller
-	currentUpload chan bool
+	currentUpload chan bool //上传到后端存储的通道
 	pendingCh     chan *pendingItem
 	pendingKeys   map[string]*pendingItem
 	pendingMutex  sync.Mutex
-	startHour     int
-	endHour       int
-	compressor    compress.Compressor
-	seekable      bool
-	upLimit       *ratelimit.Bucket
-	downLimit     *ratelimit.Bucket
+	//disk cache上传到对象存储必须在下面的时间段内进行
+	startHour  int //可以上传disk cache到对象存储的起始时间
+	endHour    int //可以上传disk cache到对象存储的截止时间
+	compressor compress.Compressor
+	seekable   bool
+	upLimit    *ratelimit.Bucket
+	downLimit  *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -963,6 +978,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 		}))
 }
 
+// 判断数据是否要从stage目录软链接到cache目录。满足任一条件即可：设置了缓存完整的block || 要缓存的数据<blocksize || 设置了延时上传
 func (store *cachedStore) shouldCache(size int) bool {
 	return store.conf.CacheFullBlock || size < store.conf.BlockSize || store.conf.UploadDelay > 0
 }
@@ -1047,6 +1063,7 @@ func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.
 	}
 	if force || store.canUpload() && time.Since(added) > store.conf.UploadDelay {
 		select {
+		//通知当前item Pending
 		case store.pendingCh <- item:
 			item.uploading = true
 			return true

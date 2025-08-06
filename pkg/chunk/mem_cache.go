@@ -32,12 +32,12 @@ type memItem struct {
 
 type memcache struct {
 	sync.Mutex
-	capacity    int64
-	maxItems    int64
-	used        int64
-	pages       map[string]memItem
-	eviction    string
-	cacheExpire time.Duration
+	capacity    int64              //容量
+	maxItems    int64              //最大缓存个数
+	used        int64              //已用容量
+	pages       map[string]memItem //缓存数据，以page管理
+	eviction    string             //淘汰算法
+	cacheExpire time.Duration      //超时时间
 
 	metrics *cacheManagerMetrics
 }
@@ -51,6 +51,7 @@ func newMemStore(config *Config, metrics *cacheManagerMetrics) *memcache {
 		cacheExpire: config.CacheExpire,
 		metrics:     metrics,
 	}
+	//对memcache对象注册一个清理函数，当golang GC回收memcache对象前，回收所有的page。因为page为手动管理的内存
 	runtime.SetFinalizer(c, func(c *memcache) {
 		for _, p := range c.pages {
 			p.page.Release()

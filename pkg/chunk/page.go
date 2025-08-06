@@ -31,18 +31,20 @@ var pageStack = os.Getenv("JFS_PAGE_STACK") != ""
 
 // Page is a page with refcount
 type Page struct {
-	refs    int32
+	refs    int32 //引用计数
 	offheap bool
-	dep     *Page
-	Data    []byte
+	dep     *Page  //depend，依赖的上一个page
+	Data    []byte //数据
 	stack   []byte
 }
 
 // NewPage create a new page.
+// 创建page但是不申请内存，通过传参传入
 func NewPage(data []byte) *Page {
 	return &Page{refs: 1, Data: data}
 }
 
+// 创建page并申请page使用的内存
 func NewOffPage(size int) *Page {
 	if size <= 0 {
 		panic("size of page should > 0")
@@ -64,6 +66,7 @@ func NewOffPage(size int) *Page {
 	return page
 }
 
+// 返回一个新的page其buff为原page的一部分，原page的ref+1
 func (p *Page) Slice(off, len int) *Page {
 	p.Acquire()
 	np := NewPage(p.Data[off : off+len])

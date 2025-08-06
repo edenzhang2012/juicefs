@@ -163,6 +163,7 @@ func Register(name string, register Creator) {
 	storages[name] = register
 }
 
+// 根据传参的name找到注册的对应对象存储的初始化函数，以s3为例，初始化函数为newS3
 func CreateStorage(name, endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	f, ok := storages[name]
 	if ok {

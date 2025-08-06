@@ -199,6 +199,7 @@ func (v *VFS) findHandle(inode Ino, fh uint64) *handle {
 			return f
 		}
 	}
+	//找不到handle，可能是重新挂载的情况
 	if fh&1 == 1 && inode != controlInode {
 		f := &handle{inode: inode, fh: fh, flags: O_RECOVERED}
 		f.cond = utils.NewCond(f)

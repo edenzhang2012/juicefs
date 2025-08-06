@@ -74,35 +74,46 @@ type pendingFile struct {
 }
 
 type cacheStore struct {
-	id         string
-	totalPages int64
+	id         string //uuid
+	totalPages int64  //已经申请的pages大小
 	sync.Mutex
-	dir           string
-	mode          os.FileMode
-	maxStageWrite int
-	capacity      int64
-	maxItems      int64
-	freeRatio     float32
-	hashPrefix    bool
-	scanInterval  time.Duration
-	cacheExpire   time.Duration
-	pending       chan pendingFile
-	pages         map[string]*Page
+	dir           string           //缓存目录
+	mode          os.FileMode      //缓存目录权限
+	maxStageWrite int              //number of threads allowed to write staged files, other requests will be uploaded directly (this option is only effective when 'writeback' mode is enabled)。默认1000
+	capacity      int64            //每个缓存目录的缓存容量，由总的缓存容量均分而来
+	maxItems      int64            //max number of cached items (0 for unlimited),默认0
+	freeRatio     float32          //min free space (ratio)，默认0.1
+	hashPrefix    bool             //从format带过来的参数，读缓存key的组成格式略有不同
+	scanInterval  time.Duration    //扫描时间间隔
+	cacheExpire   time.Duration    //缓存过期时间
+	pending       chan pendingFile // 20% of buffer could be used for pending pages。20%均分给所有缓存目录
+	pages         map[string]*Page //disk cache中的内存缓存
 	m             *cacheManagerMetrics
 
-	used      int64
-	keys      map[cacheKey]cacheItem
-	scanned   bool
-	stageFull bool
-	rawFull   bool
-	eviction  string
-	checksum  string // checksum level
+	used      int64                  //磁盘缓存已使用容量
+	keys      map[cacheKey]cacheItem //磁盘缓存中的数据
+	scanned   bool                   //是否scan，进入scan时设置为false，scan完成后再设置为true
+	stageFull bool                   //缓存盘接近满，剩余容量小于 freeRatio/2
+	rawFull   bool                   //缓存盘满，剩余容量小于 freeRatio
+	eviction  string                 //缓存驱逐策略，目前只支持“2-random”，“none”
+	checksum  string                 // checksum level
 	uploader  func(key, path string, force bool) bool
+	/*
+		//uploader
+		func(key, fpath string, force bool) bool {
+			if fi, err := os.Stat(fpath); err == nil {
+				return store.addDelayedStaging(key, fpath, fi.ModTime(), force)
+			} else {
+				logger.Warnf("Stat staging block %s: %s", fpath, err)
+				return false
+			}
+		}
+	*/
 
 	opTs map[time.Duration]func() error
 	opMu sync.Mutex
 
-	state     dcState
+	state     dcState //磁盘缓存状态
 	stateLock sync.Mutex
 }
 
@@ -418,6 +429,7 @@ func (cache *cacheStore) removeStage(key string) error {
 	return err
 }
 
+// 将数据链接到cacheStore.pages中。若cacheStore.pending未满，发送信号该sync线程，通知sync线程将数据下刷到缓存磁盘，并从cacheStore.pages移除
 func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 	if !cache.enabled() {
 		return
@@ -437,10 +449,12 @@ func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 		return
 	}
 	p.Acquire()
+	//数据链接到cache.pages中
 	cache.pages[key] = p
 	atomic.AddInt64(&cache.totalPages, int64(cap(p.Data)))
+	//若cache.pending未满，走case场景并返回；若cache.pending已满，走default分支
 	select {
-	case cache.pending <- pendingFile{key, p, dropCache}:
+	case cache.pending <- pendingFile{key, p, dropCache}: //数据写入到缓存文件中
 	default:
 		if force {
 			cache.Unlock()
@@ -484,6 +498,7 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	return usage
 }
 
+// 数据写入到缓存文件
 func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool) (err error) {
 	if !cache.available() {
 		return errCacheDown
@@ -760,11 +775,13 @@ func (cache *cacheStore) stage(key string, data []byte, keepCache bool) (string,
 	}
 	stagingBlocks.Add(1)
 	defer stagingBlocks.Add(-1)
+	//数据写入到stagingPath缓存文件中
 	err := cache.flushPage(stagingPath, data, false)
 	if err == nil {
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
 		cache.m.stageWriteBytes.Add(float64(len(data)))
+		//将rawstaging软连接到raw目录
 		if cache.enabled() && keepCache {
 			path := cache.cachePath(key)
 			cache.createDir(filepath.Dir(path))
@@ -829,11 +846,11 @@ func (cache *cacheStore) cleanupFull() {
 		if value.size < 0 {
 			continue // staging
 		}
-		if cache.cacheExpire > 0 && value.atime < cutoff {
+		if cache.cacheExpire > 0 && value.atime < cutoff { //超时
 			lastK = k
 			lastValue = value
 			cnt++
-		} else if cnt == 0 || lastValue.atime > value.atime {
+		} else if cnt == 0 || lastValue.atime > value.atime { //当前元素更晚
 			lastK = k
 			lastValue = value
 		}
@@ -1084,15 +1101,25 @@ func expandDir(pattern string) []string {
 }
 
 type CacheManager interface {
+	//将数据链接到cache.pages中。对于disk cache实现，会同时通知flush线程将内存下刷到cache disk
 	cache(key string, p *Page, force, dropCache bool)
+	//删除缓存
 	remove(key string, staging bool)
+	//获取缓存数据。对于disk cache，会先尝试从内存中获取，若没有的话从diskcache文件中加载
 	load(key string) (ReadCloser, error)
+	//判断数据是否在缓存中
 	exist(key string) (string, bool)
+	//更新cache.used
 	uploaded(key string, size int)
+	//将数据写入到缓存文件中。mem cache未实现
 	stage(key string, data []byte, keepCache bool) (string, error)
+	//删除缓存文件。mem cache未实现
 	removeStage(key string) error
+	//获取缓存的数据个数与数据容量
 	stats() (int64, int64)
+	//获取缓存内存使用量。disk cache也会占用内存缓存，主要为异步过程中的占用
 	usedMemory() int64
+	//判断缓存目录是否为空，mem cache始终为false。
 	isEmpty() bool
 	getMetrics() *cacheManagerMetrics
 }

@@ -52,10 +52,10 @@ type DataWriter interface {
 type sliceWriter struct {
 	id      uint64
 	chunk   *chunkWriter
-	off     uint32
-	length  uint32
-	soff    uint32
-	slen    uint32
+	off     uint32 //slice在chunk中的偏移
+	length  uint32 //slice的总长度
+	soff    uint32 //有效数据在此 Slice 中的偏移位置
+	slen    uint32 //有效数据长度
 	writer  chunk.Writer
 	freezed bool
 	done    bool
@@ -102,7 +102,7 @@ func (s *sliceWriter) markDone() {
 	f.Unlock()
 }
 
-// freezed, no more data
+// freezed, no more data 下刷并标记Slice写入已经完成
 func (s *sliceWriter) flushData() {
 	defer s.markDone()
 	if s.slen == 0 {
@@ -123,21 +123,24 @@ func (s *sliceWriter) flushData() {
 }
 
 // protected by s.chunk.file
+// off: 数据在slice中的偏移量
 func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.Errno {
 	f := s.chunk.file
+	//将数据从用户buff拷贝到Slice page内
 	_, err := s.writer.WriteAt(data, int64(off))
 	if err != nil {
 		logger.Warnf("write: chunk: %d off: %d %s", s.id, off, err)
 		return syscall.EIO
 	}
+	//写入的数据超过原先记载的数据长度，更新数据长度
 	if off+uint32(len(data)) > s.slen {
 		s.slen = off + uint32(len(data))
 	}
 	s.lastMod = time.Now()
-	if s.slen == meta.ChunkSize {
+	if s.slen == meta.ChunkSize { //有效数据刚好写满chunk，下刷Slice数据
 		s.freezed = true
 		go s.flushData()
-	} else if int(s.slen) >= f.w.blockSize {
+	} else if int(s.slen) >= f.w.blockSize { //有效数据写入超过block大小，下刷
 		if s.id > 0 {
 			err := s.writer.FlushTo(int(s.slen))
 			if err != nil {
@@ -159,17 +162,17 @@ type chunkWriter struct {
 func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	blockSize := uint32(c.file.w.blockSize)
 	for i := range c.slices {
-		s := c.slices[len(c.slices)-1-i]
-		if !s.freezed {
-			flushoff := s.slen / blockSize * blockSize
-			if pos >= s.off+flushoff && pos <= s.off+s.slen {
+		s := c.slices[len(c.slices)-1-i] //从后往前遍历
+		if !s.freezed {                  //数据还未下刷
+			flushoff := s.slen / blockSize * blockSize        //block取整
+			if pos >= s.off+flushoff && pos <= s.off+s.slen { //要写入的数据起始位置在Slice的最后一个非对齐的block内
 				return s
-			} else if i > 3 {
+			} else if i > 3 { //Slice是按照时间排序的，i>3说明是已经写入过去一段时间了，如果数据还未下刷，需要触发下刷逻辑
 				s.freezed = true
 				go s.flushData()
 			}
 		}
-		if pos < s.off+s.slen && s.off < pos+size {
+		if pos < s.off+s.slen && s.off < pos+size { //数据完全落在当前Slice上，需要生成新的Slice
 			// overlaped
 			// TODO: write into multiple slices
 			return nil
@@ -187,6 +190,8 @@ func (c *chunkWriter) commitThread() {
 	for len(c.slices) > 0 {
 		s := c.slices[0]
 		for !s.done {
+			//TODO 收尾工作？
+			//超过100毫秒没有收到通知 且 没有freezed 且 当前Slice已经开始处理10秒以上了
 			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > flushDuration*2 {
 				s.freezed = true
 				go s.flushData()
@@ -226,8 +231,8 @@ type fileWriter struct {
 	inode        Ino
 	length       uint64
 	err          syscall.Errno
-	flushwaiting uint16
-	writewaiting uint16
+	flushwaiting uint16 //等待下刷的chunk数量
+	writewaiting uint16 //等待写入的chunk数量
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
 
@@ -254,6 +259,7 @@ func (f *fileWriter) freeChunk(c *chunkWriter) {
 }
 
 // protected by file
+// index: chunk 编号    off: 写入数据在chunk中的偏移
 func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data []byte) syscall.Errno {
 	c := f.findChunk(indx)
 	s := c.findWritableSlice(off, uint32(len(data)))
@@ -291,13 +297,16 @@ func (w *dataWriter) usedBufferSize() int64 {
 	return utils.AllocMemory() - w.store.UsedMemory()
 }
 
+// off: 文件中的偏移量； data：要写入的数据
 func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Errno {
+	//当前Slice总数超过1000时，等待
 	for {
 		if f.totalSlices() < 1000 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
+	//当前已用的内存大小超过缓存总大小时，减慢处理速度
 	if f.w.usedBufferSize() > f.w.bufferSize {
 		// slow down
 		time.Sleep(time.Millisecond * 10)
@@ -324,6 +333,7 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	pos := uint32(off % meta.ChunkSize)
 	for len(data) > 0 {
 		n := uint32(len(data))
+		//如果写入数据超过chunk size,截断，只写入到chunk size
 		if pos+n > meta.ChunkSize {
 			n = meta.ChunkSize - pos
 		}
@@ -350,6 +360,7 @@ func (f *fileWriter) updateMtime(t time.Time) {
 	}
 }
 
+// flush fileWriter中的所有数据
 func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	s := time.Now()
 	f.Lock()
@@ -371,11 +382,14 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 				}
 			}
 		}
+		//等待信号超过3秒 && 调用端取消了请求 && 处理时长超过2*PutTimeout
 		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
 			err = syscall.EINTR
 			break
 		}
+		//deadline最少5分钟，根据maxretry参数算
+		//处理超过最长超时时间，标记IO错误
 		if time.Now().After(deadline) {
 			logger.Errorf("flush %d timeout after waited %s", f.inode, wait)
 			for _, c := range f.chunks {
@@ -428,7 +442,7 @@ type dataWriter struct {
 	store      chunk.ChunkStore
 	conf       *Config
 	reader     DataReader
-	blockSize  int
+	blockSize  int //默认4M
 	bufferSize int64
 	files      map[Ino]*fileWriter
 	maxRetries uint32

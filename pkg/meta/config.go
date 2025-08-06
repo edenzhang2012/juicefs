@@ -81,8 +81,8 @@ type Format struct {
 	SecretKey        string `json:",omitempty"`
 	SessionToken     string `json:",omitempty"`
 	BlockSize        int
-	Compression      string `json:",omitempty"`
-	Shards           int    `json:",omitempty"`
+	Compression      string `json:",omitempty"` //压缩算法
+	Shards           int    `json:",omitempty"` //EC
 	HashPrefix       bool   `json:",omitempty"`
 	Capacity         uint64 `json:",omitempty"`
 	Inodes           uint64 `json:",omitempty"`

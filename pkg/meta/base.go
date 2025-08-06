@@ -229,7 +229,7 @@ type baseMeta struct {
 	txlocks      [nlocks]sync.Mutex // Pessimistic locks to reduce conflict
 	subTrash     internalNode
 	sid          uint64
-	of           *openfiles
+	of           *openfiles //记录所有已经打开的文件
 	removedFiles map[Ino]bool
 	compacting   map[uint64]bool
 	maxDeleting  chan struct{}
@@ -373,6 +373,7 @@ func (m *baseMeta) InitMetrics(reg prometheus.Registerer) {
 	}()
 }
 
+// promethus指标
 func (m *baseMeta) timeit(method string, start time.Time) {
 	used := time.Since(start).Seconds()
 	m.opDist.Observe(used)
@@ -1596,6 +1597,7 @@ func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) sys
 	return 0
 }
 
+//先从内存缓存中获取，若没有cai
 func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (st syscall.Errno) {
 	defer func() {
 		if st == 0 {
@@ -1686,10 +1688,15 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &numSlices, &delta, &attr)
 	if st == 0 {
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
+		//slice个数与100取余==99 或者 slice个数超过350
+		//TODO numSlices%100 == 99这个条件有点儿莫名奇妙，猜测想达到的效果是每有100个Slice触发一次异步compact
 		if numSlices%100 == 99 || numSlices > 350 {
+			//slice个数小于最大slice个数（写死在代码里2500）
 			if numSlices < maxSlices {
+				//异步执行compact
 				go m.compactChunk(inode, indx, false, false)
-			} else {
+			} else { //Slice个数超过2500
+				//同步执行compact
 				m.compactChunk(inode, indx, true, false)
 			}
 		}

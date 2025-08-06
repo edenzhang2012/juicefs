@@ -1223,8 +1223,8 @@ type VFS struct {
 	writer          DataWriter
 	cacheFiller     *CacheFiller
 
-	handles   map[Ino][]*handle
-	handleIno map[uint64]Ino
+	handles   map[Ino][]*handle //每个inode可能存在多个handle，每个handle代表一次open。用户可能在不同的进程里打开同一个文件
+	handleIno map[uint64]Ino    //记录每个handle对应的inode
 	hanleM    sync.Mutex
 	nextfh    uint64
 

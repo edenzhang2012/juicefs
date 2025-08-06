@@ -20,7 +20,7 @@ import "sync"
 
 type prefetcher struct {
 	sync.Mutex
-	pending chan string
+	pending chan string //等待预取的队列
 	busy    map[string]bool
 	op      func(key string)
 }
